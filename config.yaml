@@ -1,0 +1,60 @@
+# Default configuration
+model:
+  name: "meta-llama/Llama-3.1-8B-Instruct"
+  dtype: "float16"
+  device: "auto"
+  trust_remote_code: false
+  load_in_4bit: false  # Set true if GPU memory is limited
+
+turbo_quant:
+  # Key quantization (TurboQuant_prod): unbiased inner product estimation
+  # 3-bit achieves near-lossless quality, 2-bit has marginal degradation
+  key_bit_width: 3
+
+  # Value quantization: standard per-group asymmetric quantization
+  # Values are less sensitive than keys since they don't affect attention scores
+  value_bit_width: 2
+
+  # Group size for value quantization
+  value_group_size: 32
+
+  # Number of recent tokens kept in full precision
+  # Larger buffer = better quality for recent context, more memory
+  buffer_size: 128
+
+generation:
+  max_new_tokens: 256
+  do_sample: false
+  temperature: 0.7
+  top_p: 0.9
+
+# Preset configurations
+presets:
+  # Best quality: 3.5 effective bits, ~4.6x compression
+  high_quality:
+    key_bit_width: 4
+    value_bit_width: 3
+    buffer_size: 256
+
+  # Balanced: 2.5 effective bits, ~6.4x compression
+  balanced:
+    key_bit_width: 3
+    value_bit_width: 2
+    buffer_size: 128
+
+  # Maximum compression: 2.0 effective bits, ~8x compression
+  max_compression:
+    key_bit_width: 2
+    value_bit_width: 2
+    buffer_size: 64
+
+# Recommended models (tested in the paper)
+recommended_models:
+  - name: "meta-llama/Llama-3.1-8B-Instruct"
+    notes: "Best tested model, supports 128K context"
+  - name: "mistralai/Mistral-7B-Instruct-v0.3"
+    notes: "Good performance, 32K context"
+  - name: "google/gemma-2-9b-it"
+    notes: "Strong quality, 8K context"
+  - name: "Qwen/Qwen2.5-7B-Instruct"
+    notes: "Multilingual, 128K context"
