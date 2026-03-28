@@ -143,6 +143,17 @@ demo.py                CPU-only smoke test, no downloads needed
 config.yaml            Default settings and presets
 ```
 
+## Acknowledgments
+
+This project is an independent implementation based on research by Google Research. The algorithms, theory, and experimental results come entirely from the original authors -- this repo just puts their ideas into a usable Python package.
+
+All credit for the underlying research belongs to:
+- **Amir Zandieh, Majid Daliri, Majid Hadian, Vahab Mirrokni** for TurboQuant
+- **Amir Zandieh, Majid Daliri, Insu Han** for QJL
+- **Insu Han, Praneeth Kacham, Amin Karbasi, Vahab Mirrokni, Amir Zandieh** for PolarQuant
+
+The official QJL reference code is available at [github.com/amirzandieh/QJL](https://github.com/amirzandieh/QJL) (Apache-2.0).
+
 ## References
 
 - Zandieh, Daliri, Hadian, Mirrokni. *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate.* ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
@@ -151,7 +162,7 @@ config.yaml            Default settings and presets
 
 ## License
 
-MIT
+MIT -- see [LICENSE](LICENSE) for details.
 
 ## License
 

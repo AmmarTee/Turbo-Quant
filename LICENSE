@@ -2,6 +2,22 @@ MIT License
 
 Copyright (c) 2025 AmmarTee
 
+This software is an independent implementation based on the following research
+by Google Research. The algorithms and theory originate from the original
+authors and their papers:
+
+  - TurboQuant (ICLR 2026) by Zandieh, Daliri, Hadian, Mirrokni
+    https://arxiv.org/abs/2504.19874
+
+  - QJL (AAAI 2025) by Zandieh, Daliri, Han
+    https://arxiv.org/abs/2406.03482
+
+  - PolarQuant (AISTATS 2026) by Han, Kacham, Karbasi, Mirrokni, Zandieh
+    https://arxiv.org/abs/2502.02617
+
+The official QJL reference implementation is available at
+https://github.com/amirzandieh/QJL under the Apache-2.0 license.
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
