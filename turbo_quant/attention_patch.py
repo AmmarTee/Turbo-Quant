@@ -15,7 +15,7 @@ autoregressive generation, enabling >4x memory reduction for long contexts.
 
 import math
 import warnings
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from functools import wraps
 
 import torch
@@ -53,6 +53,7 @@ class TurboQuantAttentionWrapper:
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ):
         """Modified forward that uses TurboQuant KV cache."""
@@ -65,16 +66,21 @@ class TurboQuantAttentionWrapper:
         value_states = attn.v_proj(hidden_states)
 
         # Reshape to (batch, heads, seq, head_dim)
-        num_heads = getattr(attn, "num_heads", attn.config.num_attention_heads if hasattr(attn, "config") else query_states.shape[-1] // attn.head_dim)
-        num_kv_heads = getattr(attn, "num_key_value_heads", num_heads)
         head_dim = attn.head_dim
+        num_heads = query_states.shape[-1] // head_dim
+        num_kv_heads = key_states.shape[-1] // head_dim
 
         query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
 
-        # Apply RoPE
-        if hasattr(attn, "rotary_emb"):
+        # Apply RoPE -- newer transformers passes (cos, sin) via position_embeddings
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = _apply_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
+        elif hasattr(attn, "rotary_emb"):
             cos, sin = attn.rotary_emb(value_states, position_ids)
             query_states, key_states = _apply_rotary_pos_emb(
                 query_states, key_states, cos, sin
@@ -83,10 +89,35 @@ class TurboQuantAttentionWrapper:
         # Update TurboQuant KV cache
         self.kv_cache.update(key_states, value_states)
 
+        # Feed tiny slices into the model's DynamicCache so generate()
+        # tracks sequence length for correct mask/position on decode steps.
+        # Only 1 head, 1 dim -- just enough for seq_len bookkeeping.
+        if past_key_value is not None:
+            cache_kwargs = {}
+            if position_embeddings is not None:
+                cache_kwargs["sin"] = position_embeddings[1]
+                cache_kwargs["cos"] = position_embeddings[0]
+            if cache_position is not None:
+                cache_kwargs["cache_position"] = cache_position
+            tiny_k = key_states[:, :1, :, :1]
+            tiny_v = value_states[:, :1, :, :1]
+            past_key_value.update(tiny_k, tiny_v, self.layer_idx, cache_kwargs)
+
         # Compute attention using compressed cache
         kv_seq_len = self.kv_cache.get_seq_length()
 
-        # Build proper attention mask for the full sequence
+        # Build causal mask if none provided (required for correct prefill)
+        if attention_mask is None and q_len > 1:
+            # Create causal mask: (1, 1, q_len, kv_seq_len)
+            attention_mask = torch.full(
+                (1, 1, q_len, kv_seq_len), float("-inf"),
+                device=hidden_states.device, dtype=hidden_states.dtype,
+            )
+            # For prefill, kv_seq_len == q_len, so we mask the upper triangle
+            seq_offset = kv_seq_len - q_len
+            attention_mask = torch.triu(attention_mask, diagonal=seq_offset + 1)
+
+        # Extend mask if it doesn't cover the full kv sequence length
         if attention_mask is not None and attention_mask.shape[-1] < kv_seq_len:
             # Extend mask if needed
             pad_len = kv_seq_len - attention_mask.shape[-1]
@@ -101,7 +132,7 @@ class TurboQuantAttentionWrapper:
         # Output projection
         attn_output = attn.o_proj(attn_output)
 
-        return attn_output, None, self.kv_cache if use_cache else None
+        return attn_output, None
 
 
 def _apply_rotary_pos_emb(q, k, cos, sin):
