@@ -1,70 +1,85 @@
-# TurboQuant: Run Heavy LLMs with Extreme KV Cache Compression
+# TurboQuant
 
-Implementation of **TurboQuant** (ICLR 2026), a near-optimal vector quantization
-algorithm that compresses the KV cache of large language models to ~3 bits per
-value with zero accuracy loss.
+Compress the KV cache of large language models down to ~3 bits during inference. No fine-tuning, no training -- just patch your HuggingFace model and go.
 
-Based on three papers from Google Research:
-- [TurboQuant](https://arxiv.org/abs/2504.19874) - The combined system (ICLR 2026)
-- [QJL](https://arxiv.org/abs/2406.03482) - 1-bit quantized JL transform (AAAI 2025)
-- [PolarQuant](https://arxiv.org/abs/2502.02617) - Polar coordinate quantization (AISTATS 2026)
+This is a from-scratch implementation of the TurboQuant paper (ICLR 2026) by Zandieh et al. The core idea: randomly rotate key vectors onto the unit sphere, quantize each coordinate with a Lloyd-Max codebook, then correct the residual with a 1-bit Johnson-Lindenstrauss sketch. The result is an unbiased inner product estimator that lets you shrink the KV cache by 5-8x without wrecking attention quality.
 
-## What This Does
-
-TurboQuant compresses the Key-Value cache during LLM inference, enabling:
-- **>5x memory reduction** for the KV cache (16-bit to ~3-bit)
-- **Up to 8x speedup** in attention computation (on H100 GPUs)
-- **Zero accuracy loss** at 3.5 bits, marginal degradation at 2.5 bits
-- **No training or fine-tuning** required -- works as a drop-in replacement
-
-This lets you run larger models, process longer contexts, and serve more
-concurrent users on the same hardware.
+Papers this builds on:
+- [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) -- the full system
+- [QJL](https://arxiv.org/abs/2406.03482) (AAAI 2025) -- the 1-bit residual trick
+- [PolarQuant](https://arxiv.org/abs/2502.02617) (AISTATS 2026) -- polar coordinate quantization
 
 ## Quick Start
 
-### Install
+Clone the repo and install dependencies:
 
 ```bash
+git clone https://github.com/AmmarTee/Turbo-Quant.git
+cd Turbo-Quant
 pip install -r requirements.txt
 ```
 
-### Run Inference
+### Sanity check (no GPU, no model download)
+
+Run the smoke test first to make sure everything is wired up:
 
 ```bash
-# Basic: Run Llama-3.1-8B with TurboQuant
-python run_inference.py \
-    --model meta-llama/Llama-3.1-8B-Instruct \
-    --prompt "Explain the theory of relativity in simple terms" \
-    --max-new-tokens 256
+python demo.py
+```
 
-# Memory-constrained: Use 4-bit model weights + TurboQuant KV cache
+This tests QJL, the Lloyd-Max codebook, TurboQuant MSE/Prod quantizers, and the KV cache layer -- all on CPU with random vectors. Takes a few seconds.
+
+### Run a real model
+
+The quickstart script picks a model that fits your hardware automatically:
+
+```bash
+python quickstart.py
+```
+
+It checks your GPU VRAM and picks accordingly -- TinyLlama on CPU, Llama-3.1-8B with 4-bit weights on 8+ GB GPUs, full fp16 on 18+ GB. You can also specify a model directly:
+
+```bash
+# Small model, fast test
+python quickstart.py --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+# Heavy model with 4-bit weights to fit in VRAM
+python quickstart.py --model "meta-llama/Llama-3.1-8B-Instruct" --load-in-4bit
+
+# Custom prompt
+python quickstart.py --prompt "Write a short essay about black holes"
+```
+
+### Full CLI (more options)
+
+For finer control over quantization settings, use `run_inference.py`:
+
+```bash
 python run_inference.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
-    --load-in-4bit \
     --key-bits 3 --value-bits 2 \
-    --prompt "Write a Python function to sort a linked list"
+    --prompt "Explain the theory of relativity in simple terms"
 
-# Compare with/without compression
+# Compare output with and without compression
 python run_inference.py \
     --model mistralai/Mistral-7B-Instruct-v0.3 \
     --prompt "What are the key challenges in quantum computing?" \
     --compare
 
-# Long document processing
+# 4-bit model weights + TurboQuant KV cache (lowest memory)
 python run_inference.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
-    --prompt-file long_document.txt \
-    --max-new-tokens 512 \
-    --buffer-size 256
+    --load-in-4bit --key-bits 3 --value-bits 2 \
+    --prompt "Write a Python function to sort a linked list"
 ```
 
-### Use as a Library
+### Use as a library
 
 ```python
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from turbo_quant import patch_model_for_turbo_quant
 
-# Load any HuggingFace model
 model = AutoModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.1-8B-Instruct",
     torch_dtype=torch.float16,
@@ -72,112 +87,71 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
 
-# Patch with TurboQuant -- one line!
+# one line to patch
 model, kv_caches = patch_model_for_turbo_quant(
     model,
-    key_bit_width=3,    # 3-bit keys (TurboQuant_prod)
-    value_bit_width=2,  # 2-bit values (group quantization)
-    buffer_size=128,    # Recent tokens in full precision
+    key_bit_width=3,
+    value_bit_width=2,
+    buffer_size=128,
 )
 
-# Use normally -- compression is automatic
 inputs = tokenizer("Hello, how are you?", return_tensors="pt").to("cuda")
 outputs = model.generate(**inputs, max_new_tokens=100)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
-## How TurboQuant Works
+## How it works
 
-### The Algorithm (Two-Stage Approach)
+TurboQuant is a two-stage quantizer:
 
-**Stage 1 -- MSE-Optimal Scalar Quantization:**
-1. Randomly rotate the input vector: `y = Pi * x` (where Pi is a random orthogonal matrix)
-2. After rotation, each coordinate follows a Beta distribution (converges to Gaussian in high dimensions)
-3. Apply precomputed Lloyd-Max optimal scalar quantizers to each coordinate independently
-4. This uses (b-1) bits and captures the main signal
+1. **Rotate + scalar quantize (b-1 bits):** Multiply the vector by a random orthogonal matrix so that each coordinate is roughly Gaussian, then quantize each one independently with a precomputed Lloyd-Max codebook. This captures most of the signal.
 
-**Stage 2 -- QJL Residual Correction (1 bit):**
-1. Compute the residual: `r = x - dequantize(quantize(x))`
-2. Apply the QJL transform: `sign(S * r)` where S is a random Gaussian matrix
-3. This eliminates bias in inner product estimation
+2. **QJL on the residual (1 bit):** Take the quantization error from stage 1, project it with a random Gaussian matrix, and store just the signs. This corrects the bias in inner product estimation and costs only 1 bit per dimension.
 
-The result is an **unbiased** inner product estimator with near-optimal distortion:
+Keys use TurboQuant_prod (both stages) because attention scores are inner products and bias matters there. Values use plain per-group min-max quantization since they only get multiplied by already-computed attention weights.
 
-$$D_{\text{prod}} \leq \frac{3\sqrt{\pi}}{2} \cdot \frac{\|y\|^2}{d} \cdot \frac{1}{4^b}$$
+## Presets
 
-### Key Quantization (TurboQuant_prod)
+| Preset | Key bits | Value bits | Effective bits | Compression | Quality |
+| --- | --- | --- | --- | --- | --- |
+| high_quality | 4 | 3 | 3.5 | ~4.6x | Lossless |
+| balanced | 3 | 2 | 2.5 | ~6.4x | Near-lossless |
+| max_compression | 2 | 2 | 2.0 | ~8.0x | Slight degradation |
 
-Keys in the KV cache are used to compute attention scores via inner products
-with queries. TurboQuant_prod provides **unbiased** estimation of these inner
-products, which is critical for maintaining attention quality.
+## Supported models
 
-### Value Quantization (Group Quantization)
+Works with any HuggingFace causal LM that uses standard attention. Currently handles Llama (2/3/3.1), Mistral, Gemma, Qwen2, and Phi-3 architectures. Adding a new architecture just means telling the patcher where to find the attention layers.
 
-Values don't need unbiased inner product properties -- they are multiplied
-by already-computed attention weights. Standard per-group min-max quantization
-works well here with minimal overhead.
+## Hardware
 
-## Architecture
+- **8+ GB VRAM:** 7B models with 4-bit weights + TurboQuant KV cache
+- **16+ GB VRAM:** 7B models in fp16
+- **CPU:** Works, just slow -- fine for testing with TinyLlama
+
+## Project layout
 
 ```
 turbo_quant/
-  __init__.py            -- Package exports
-  qjl.py                -- QJL 1-bit quantizer (Johnson-Lindenstrauss)
-  codebook.py            -- Lloyd-Max scalar quantizer codebooks
-  turbo_quant.py         -- TurboQuant MSE and Prod quantizers
-  kv_cache.py            -- KV cache integration layer
-  attention_patch.py     -- HuggingFace model patcher
-run_inference.py         -- CLI inference script
-config.yaml              -- Default configuration
+  qjl.py              QJL 1-bit sign quantizer
+  codebook.py          Lloyd-Max codebooks for Gaussian distributions
+  turbo_quant.py       TurboQuant MSE and Prod quantizers
+  kv_cache.py          Compressed KV cache with streaming updates
+  attention_patch.py   Monkey-patches HuggingFace attention layers
+quickstart.py          Auto-picks a model and runs it
+run_inference.py       Full CLI with all the knobs
+demo.py                CPU-only smoke test, no downloads needed
+config.yaml            Default settings and presets
 ```
-
-## Configuration Presets
-
-| Preset | Key Bits | Value Bits | Effective | Compression | Quality |
-| --- | --- | --- | --- | --- | --- |
-| High Quality | 4 | 3 | 3.5 bit | ~4.6x | Lossless |
-| Balanced | 3 | 2 | 2.5 bit | ~6.4x | Near-lossless |
-| Max Compression | 2 | 2 | 2.0 bit | ~8.0x | Slight degradation |
-
-## Supported Models
-
-Any HuggingFace causal LM with standard attention. Tested architectures:
-- **Llama** family (Llama-2, Llama-3, Llama-3.1, CodeLlama)
-- **Mistral** / Mixtral
-- **Gemma** family
-- **Qwen2** family
-- **Phi-3**
-
-## Hardware Requirements
-
-- **GPU**: Any NVIDIA GPU with >= 8GB VRAM (for 7-8B models with 4-bit weights)
-- **For full fp16**: >= 16GB VRAM for 7B models, >= 40GB for 13B models
-- **CPU**: Supported but significantly slower
 
 ## References
 
-```bibtex
-@inproceedings{zandieh2025turboquant,
-  title={TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate},
-  author={Zandieh, Amir and Daliri, Majid and Hadian, Majid and Mirrokni, Vahab},
-  booktitle={International Conference on Learning Representations (ICLR)},
-  year={2026}
-}
+- Zandieh, Daliri, Hadian, Mirrokni. *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate.* ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
+- Zandieh, Daliri, Han. *QJL: 1-Bit Quantized JL Transform for KV Cache Quantization with Zero Overhead.* AAAI 2025. [arXiv:2406.03482](https://arxiv.org/abs/2406.03482)
+- Han, Kacham, Karbasi, Mirrokni, Zandieh. *PolarQuant: Quantizing KV Caches with Polar Transformation.* AISTATS 2026. [arXiv:2502.02617](https://arxiv.org/abs/2502.02617)
 
-@inproceedings{zandieh2024qjl,
-  title={QJL: 1-Bit Quantized JL Transform for KV Cache Quantization with Zero Overhead},
-  author={Zandieh, Amir and Daliri, Majid and Han, Insu},
-  booktitle={AAAI Conference on Artificial Intelligence},
-  year={2025}
-}
+## License
 
-@inproceedings{han2025polarquant,
-  title={PolarQuant: Quantizing KV Caches with Polar Transformation},
-  author={Han, Insu and Kacham, Praneeth and Karbasi, Amin and Mirrokni, Vahab and Zandieh, Amir},
-  booktitle={International Conference on Artificial Intelligence and Statistics (AISTATS)},
-  year={2026}
-}
-```
+MIT
 
 ## License
 
